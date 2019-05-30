@@ -1,4 +1,4 @@
-import {
+import ServiceCheck, {
   formatHumanReadable,
   formatMarkdown,
   formatTimePeriod
@@ -6,6 +6,334 @@ import {
 import checkSchemaResult from "../../../../__fixtures__/check-schema-result";
 import { ChangeSeverity } from "apollo-language-server/lib/graphqlTypes";
 import chalk from "chalk";
+import nock = require("nock");
+import { stdout, stderr } from "stdout-stderr";
+import * as graphql from "graphql";
+import { resultKeyNameFromField } from "apollo-utilities";
+
+let mockedConsoleLogOriginal: Console["log"] | null = null;
+let mockedConsoleLogValues: string[] | null = null;
+
+/**
+ * Mock and capture `console.log` and `stdout.write`s. Return them in that order as a single string.
+ *
+ * This will emulate what the output of running the CLI would look like.
+ *
+ * Call `uncaptureApplicationOutput` to reverse the effects of this function.
+ */
+function captureApplicationOutput() {
+  mockedConsoleLogOriginal = console["log"];
+  mockedConsoleLogValues = [];
+  console["log"] = jest.fn((...items) => {
+    if (!mockedConsoleLogValues) {
+      throw new Error(
+        "mockedConsoleLogValues is not prepared but we're still capturing console.log. This means there's a bug somewhere."
+      );
+    }
+
+    mockedConsoleLogValues.push(items.join(" "));
+  });
+
+  stdout.start();
+}
+
+/**
+ * Reverse mocking of `console.log` and `stdout.write`. If they weren't mocked to begin with, this will do
+ * nothing and return null.
+ */
+function uncaptureApplicationOutput(): string | null {
+  // These will be `null` if we haven't mocked `console.log`.
+  if (!mockedConsoleLogOriginal || !mockedConsoleLogValues) {
+    return null;
+  }
+
+  const result = mockedConsoleLogValues.concat(stdout.output).join("\n");
+  mockedConsoleLogValues = null;
+
+  // Restore `console.log`
+  console["log"] = mockedConsoleLogOriginal;
+
+  // Stop capturing `stdout`.
+  stdout.stop();
+
+  return result;
+}
+
+/**
+ * Convert a schema SDL to an introspection query result.
+ *
+ * @see https://blog.apollographql.com/three-ways-to-represent-your-graphql-schema-a41f4175100d
+ *
+ * @param schemaSdl string Schema in SDL form
+ */
+function sdlToIntrospectionQueryResult(schemaSdl: string) {
+  return graphql.graphqlSync(
+    graphql.buildSchema(schemaSdl),
+    graphql.introspectionQuery
+  ).data;
+}
+
+/**
+ * Use `nock` to mock an `IntrospectionQuery`
+ *
+ * @param url string Root of the URL to mock; `/graphql` will automatically be appended
+ * @param sdl SDL of the schema to mock
+ */
+function mockIntrospectionQuery(url: string, sdl: string) {
+  nock(url, { encodedQueryParams: true })
+    .post("/graphql", request => request.operationName === "IntrospectionQuery")
+    .reply(200, {
+      data: sdlToIntrospectionQueryResult(sdl)
+    });
+}
+
+/**
+ * Mock network requests for a non-federated schema check that produces errors.
+ */
+function mockNonFederatedFailure() {
+  const sdl = `
+    directive @cacheControl(maxAge: Int, scope: CacheControlScope) on FIELD_DEFINITION | OBJECT | INTERFACE
+
+    enum CacheControlScope {
+      PUBLIC
+      PRIVATE
+    }
+
+    type Launch {
+      id: ID!
+      site: String
+      mission: Mission
+      rocket: Rocket
+      isBooked: Boolean!
+    }
+
+    """
+    Simple wrapper around our list of launches that contains a cursor to the
+    last item in the list. Pass this cursor to the launches query to fetch results
+    after these.
+    """
+    type LaunchConnection {
+      cursor: String!
+      hasMore: Boolean!
+      launches: [Launch]!
+    }
+
+    type Mission {
+      name: String
+      missionPatch(size: PatchSize): String
+    }
+
+    type Mutation {
+      bookTrips(launchIds: [ID]!): TripUpdateResponse!
+      cancelTrip(launchId: ID!): TripUpdateResponse!
+      login(email: String): String
+    }
+
+    enum PatchSize {
+      SMALL
+      LARGE
+    }
+
+    type Query {
+      launches(
+        """The number of results to show. Must be >= 1. Default = 20"""
+        pageSize: Int
+
+        """
+        If you add a cursor here, it will only return results _after_ this cursor
+        """
+        after: String!
+      ): LaunchConnection!
+      launch(id: ID!): Launch
+      me: User
+    }
+
+    type Rocket {
+      id: ID!
+      name: String
+      type: String
+    }
+
+    type TripUpdateResponse {
+      success: Boolean!
+      message: String
+      launches: [Launch]
+    }
+
+    """
+    The \`Upload\` scalar type represents a file upload promise that resolves an
+    object containing \`stream\`, \`filename\`, \`mimetype\` and \`encoding\`.
+    """
+    scalar Upload
+
+    type User {
+      id: ID!
+      email: String!
+      trips: [Launch]!
+    }
+  `;
+
+  mockIntrospectionQuery("http://localhost:4000", sdl);
+
+  nock("https://engine-staging-graphql.apollographql.com:443", {
+    encodedQueryParams: true
+  })
+    .post("/api/graphql", () => true)
+    .reply(200, {
+      data: {
+        service: {
+          checkSchema: {
+            targetUrl:
+              "https://engine-staging.apollographql.com/service/justin-fullstack-tutorial/check/3acd7765-61b2-4f1a-9227-8b288e42bfdc",
+            diffToPrevious: {
+              severity: "FAILURE",
+              affectedClients: [],
+              affectedQueries: [],
+              numberOfCheckedOperations: 0,
+              changes: [
+                {
+                  severity: "FAILURE",
+                  code: "ARG_CHANGED_TYPE",
+                  description:
+                    "`Query.launches` argument `after` has changed type from `String` to `String!`"
+                }
+              ],
+              validationConfig: {
+                from: "-47347200",
+                to: "-0",
+                queryCountThreshold: 1,
+                queryCountThresholdPercentage: 0
+              }
+            }
+          }
+        }
+      }
+    });
+}
+
+/**
+ * Mock network requests for a non-federated schema check that produces no errors.
+ */
+function mockNonFederatedSuccess() {
+  const sdl = `
+    directive @cacheControl(maxAge: Int, scope: CacheControlScope) on FIELD_DEFINITION | OBJECT | INTERFACE
+
+    enum CacheControlScope {
+      PUBLIC
+      PRIVATE
+    }
+
+    type Launch {
+      id: ID!
+      site: String
+      mission: Mission
+      rocket: Rocket
+      isBooked: Boolean!
+    }
+
+    """
+    Simple wrapper around our list of launches that contains a cursor to the
+    last item in the list. Pass this cursor to the launches query to fetch results
+    after these.
+    """
+    type LaunchConnection {
+      cursor: String!
+      hasMore: Boolean!
+      launches: [Launch]!
+    }
+
+    type Mission {
+      name: String
+      missionPatch(size: PatchSize): String
+    }
+
+    type Mutation {
+      bookTrips(launchIds: [ID]!): TripUpdateResponse!
+      cancelTrip(launchId: ID!): TripUpdateResponse!
+      login(email: String): String
+    }
+
+    enum PatchSize {
+      SMALL
+      LARGE
+    }
+
+    type Query {
+      launches(
+        """The number of results to show. Must be >= 1. Default = 20"""
+        pageSize: Int
+
+        """
+        If you add a cursor here, it will only return results _after_ this cursor
+        """
+        after: String!
+      ): LaunchConnection!
+      launch(id: ID!): Launch
+      me: User
+    }
+
+    type Rocket {
+      id: ID!
+      name: String
+      type: String
+    }
+
+    type TripUpdateResponse {
+      success: Boolean!
+      message: String
+      launches: [Launch]
+    }
+
+    """
+    The \`Upload\` scalar type represents a file upload promise that resolves an
+    object containing \`stream\`, \`filename\`, \`mimetype\` and \`encoding\`.
+    """
+    scalar Upload
+
+    type User {
+      id: ID!
+      email: String!
+      trips: [Launch]!
+    }
+  `;
+
+  mockIntrospectionQuery("http://localhost:4000", sdl);
+
+  nock("https://engine-staging-graphql.apollographql.com:443", {
+    encodedQueryParams: true
+  })
+    .post("/api/graphql", () => true)
+    .reply(200, {
+      data: {
+        service: {
+          checkSchema: {
+            targetUrl:
+              "https://engine-staging.apollographql.com/service/justin-fullstack-tutorial/check/3acd7765-61b2-4f1a-9227-8b288e42bfdc",
+            diffToPrevious: {
+              severity: "NOTICE",
+              affectedClients: [],
+              affectedQueries: [],
+              numberOfCheckedOperations: 0,
+              changes: [
+                {
+                  severity: "NOTICE",
+                  code: "ARG_CHANGED_TYPE",
+                  description:
+                    "`Query.launches` argument `after` has changed type from `String` to `String!`"
+                }
+              ],
+              validationConfig: {
+                from: "-47347200",
+                to: "-0",
+                queryCountThreshold: 1,
+                queryCountThresholdPercentage: 0
+              }
+            }
+          }
+        }
+      }
+    });
+}
 
 describe("service:check", () => {
   let originalChalkEnabled;
@@ -13,10 +341,49 @@ describe("service:check", () => {
   beforeEach(() => {
     originalChalkEnabled = chalk.enabled;
     chalk.enabled = false;
+
+    // Clean console log capturing before tests in the event that `afterEach` was not run successfully.
+    uncaptureApplicationOutput();
+
+    // Clean up all network mocks before tests in the event that `afterEach` was not run successfully.
+    nock.cleanAll();
   });
 
   afterEach(() => {
     chalk.enabled = originalChalkEnabled;
+
+    // Clean up console log mocking
+    uncaptureApplicationOutput();
+
+    // Clean up all network mocks
+    nock.cleanAll();
+  });
+
+  // These are integration tests and not e2e tests because these don't actually hit the remote server.
+  describe("integration", () => {
+    describe("non-federated", () => {
+      it("should report traffic errors correctly", async () => {
+        captureApplicationOutput();
+        mockNonFederatedFailure();
+        expect.assertions(2);
+
+        await expect(ServiceCheck.run([])).rejects.toThrow();
+
+        // Inline snapshots don't work here due to https://github.com/facebook/jest/issues/6744.
+        expect(uncaptureApplicationOutput()).toMatchSnapshot();
+      });
+
+      it("should report traffic notices correctly", async () => {
+        captureApplicationOutput();
+        mockNonFederatedSuccess();
+        expect.assertions(2);
+
+        await expect(ServiceCheck.run([])).resolves.not.toThrow();
+
+        // Inline snapshots don't work here due to https://github.com/facebook/jest/issues/6744.
+        expect(uncaptureApplicationOutput()).toMatchSnapshot();
+      });
+    });
   });
 
   describe("markdown formatting", () => {
@@ -28,15 +395,15 @@ describe("service:check", () => {
           checkSchemaResult
         })
       ).toMatchInlineSnapshot(`
-        "
-        ### Apollo Service Check
-        🔄 Validated your local schema against schema tag \`staging\` on service \`engine\`.
-        🔢 Compared **18 schema changes** against **100 operations** seen over the **last 24 hours**.
-        ❌ Found **7 breaking changes** that would affect **3 operations** across **2 clients**
+                "
+                ### Apollo Service Check
+                🔄 Validated your local schema against schema tag \`staging\` on service \`engine\`.
+                🔢 Compared **18 schema changes** against **100 operations** seen over the **last 24 hours**.
+                ❌ Found **7 breaking changes** that would affect **3 operations** across **2 clients**
 
-        🔗 [View your service check details](https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z).
-        "
-      `);
+                🔗 [View your service check details](https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z).
+                "
+            `);
       // Check when all the values are singluar
       expect(
         formatMarkdown({
@@ -62,15 +429,15 @@ describe("service:check", () => {
           }
         })
       ).toMatchInlineSnapshot(`
-        "
-        ### Apollo Service Check
-        🔄 Validated your local schema against schema tag \`staging\` on service \`engine\`.
-        🔢 Compared **1 schema change** against **1 operation** seen over the **last 24 hours**.
-        ❌ Found **1 breaking change** that would affect **1 operation** across **1 client**
+                "
+                ### Apollo Service Check
+                🔄 Validated your local schema against schema tag \`staging\` on service \`engine\`.
+                🔢 Compared **1 schema change** against **1 operation** seen over the **last 24 hours**.
+                ❌ Found **1 breaking change** that would affect **1 operation** across **1 client**
 
-        🔗 [View your service check details](https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z).
-        "
-      `);
+                🔗 [View your service check details](https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z).
+                "
+            `);
     });
 
     it("is correct with no breaking changes", () => {
@@ -90,15 +457,15 @@ describe("service:check", () => {
           }
         })
       ).toMatchInlineSnapshot(`
-        "
-        ### Apollo Service Check
-        🔄 Validated your local schema against schema tag \`staging\` on service \`engine\`.
-        🔢 Compared **0 schema changes** against **100 operations** seen over the **last 24 hours**.
-        ✅ Found **no breaking changes**.
+                "
+                ### Apollo Service Check
+                🔄 Validated your local schema against schema tag \`staging\` on service \`engine\`.
+                🔢 Compared **0 schema changes** against **100 operations** seen over the **last 24 hours**.
+                ✅ Found **no breaking changes**.
 
-        🔗 [View your service check details](https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z).
-        "
-      `);
+                🔗 [View your service check details](https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z).
+                "
+            `);
     });
   });
 
@@ -131,29 +498,29 @@ describe("service:check", () => {
           checkSchemaResult
         })
       ).toMatchInlineSnapshot(`
-        "
-        FAIL    ARG_REMOVED                \`ServiceMutation.uploadSchema\` arg \`gitContext\` was removed
-        FAIL    ARG_REMOVED                \`ServiceMutation.uploadSchema\` arg \`schema\` was removed
-        FAIL    ARG_REMOVED                \`ServiceMutation.uploadSchema\` arg \`tag\` was removed
-        FAIL    FIELD_CHANGED_TYPE         \`Change.argNode\` changed type from \`NamedIntrospectionArg\` to \`NamedIntrospectionValue\`
-        FAIL    FIELD_REMOVED              \`Change.affectedClients\` was removed
-        FAIL    FIELD_REMOVED              \`NamedIntrospectionValue.printedType\` was removed
-        FAIL    TYPE_REMOVED               \`NamedIntrospectionArg\` removed
+                "
+                FAIL    ARG_REMOVED                \`ServiceMutation.uploadSchema\` arg \`gitContext\` was removed
+                FAIL    ARG_REMOVED                \`ServiceMutation.uploadSchema\` arg \`schema\` was removed
+                FAIL    ARG_REMOVED                \`ServiceMutation.uploadSchema\` arg \`tag\` was removed
+                FAIL    FIELD_CHANGED_TYPE         \`Change.argNode\` changed type from \`NamedIntrospectionArg\` to \`NamedIntrospectionValue\`
+                FAIL    FIELD_REMOVED              \`Change.affectedClients\` was removed
+                FAIL    FIELD_REMOVED              \`NamedIntrospectionValue.printedType\` was removed
+                FAIL    TYPE_REMOVED               \`NamedIntrospectionArg\` removed
 
-        PASS    ARG_REMOVED                \`ServiceMutation.registerOperations\` arg \`manifestVersion\` was removed
-        PASS    ARG_REMOVED                \`ServiceMutation.uploadSchema\` arg \`historicParameters\` was removed
-        PASS    FIELD_ADDED                \`Service.schemaNotificationChannels\` was added
-        PASS    FIELD_ADDED                \`ServiceMutation.deregisterSchemaNotificationChannel\` was added
-        PASS    FIELD_ADDED                \`ServiceMutation.registerSchemaNotificationChannel\` was added
-        PASS    FIELD_DEPRECATION_REMOVED  \`AffectedClient.clientId\` is no longer deprecated
-        PASS    FIELD_DEPRECATION_REMOVED  \`Change.description\` is no longer deprecated
-        PASS    FIELD_REMOVED              \`AffectedClient.clientReferenceId\` was removed
-        PASS    FIELD_REMOVED              \`Change.affectedClientIdVersionPairs\` was removed
-        PASS    FIELD_REMOVED              \`Change.affectedClientReferenceIds\` was removed
-        PASS    FIELD_REMOVED              \`SchemaDiff.numberOfCheckedOperations\` was removed
+                PASS    ARG_REMOVED                \`ServiceMutation.registerOperations\` arg \`manifestVersion\` was removed
+                PASS    ARG_REMOVED                \`ServiceMutation.uploadSchema\` arg \`historicParameters\` was removed
+                PASS    FIELD_ADDED                \`Service.schemaNotificationChannels\` was added
+                PASS    FIELD_ADDED                \`ServiceMutation.deregisterSchemaNotificationChannel\` was added
+                PASS    FIELD_ADDED                \`ServiceMutation.registerSchemaNotificationChannel\` was added
+                PASS    FIELD_DEPRECATION_REMOVED  \`AffectedClient.clientId\` is no longer deprecated
+                PASS    FIELD_DEPRECATION_REMOVED  \`Change.description\` is no longer deprecated
+                PASS    FIELD_REMOVED              \`AffectedClient.clientReferenceId\` was removed
+                PASS    FIELD_REMOVED              \`Change.affectedClientIdVersionPairs\` was removed
+                PASS    FIELD_REMOVED              \`Change.affectedClientReferenceIds\` was removed
+                PASS    FIELD_REMOVED              \`SchemaDiff.numberOfCheckedOperations\` was removed
 
-        View full details at: https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z"
-      `);
+                View full details at: https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z"
+            `);
     });
 
     it("should have correct output with only non-breaking changes", () => {
@@ -170,11 +537,11 @@ describe("service:check", () => {
           }
         })
       ).toMatchInlineSnapshot(`
-        "
-        No changes present between schemas
+                "
+                No changes present between schemas
 
-        View full details at: https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z"
-      `);
+                View full details at: https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z"
+            `);
     });
 
     it("should have correct output with only breaking changes", () => {
@@ -193,17 +560,17 @@ describe("service:check", () => {
           }
         })
       ).toMatchInlineSnapshot(`
-        "
-        FAIL    ARG_REMOVED         \`ServiceMutation.uploadSchema\` arg \`gitContext\` was removed
-        FAIL    ARG_REMOVED         \`ServiceMutation.uploadSchema\` arg \`schema\` was removed
-        FAIL    ARG_REMOVED         \`ServiceMutation.uploadSchema\` arg \`tag\` was removed
-        FAIL    FIELD_CHANGED_TYPE  \`Change.argNode\` changed type from \`NamedIntrospectionArg\` to \`NamedIntrospectionValue\`
-        FAIL    FIELD_REMOVED       \`Change.affectedClients\` was removed
-        FAIL    FIELD_REMOVED       \`NamedIntrospectionValue.printedType\` was removed
-        FAIL    TYPE_REMOVED        \`NamedIntrospectionArg\` removed
+                "
+                FAIL    ARG_REMOVED         \`ServiceMutation.uploadSchema\` arg \`gitContext\` was removed
+                FAIL    ARG_REMOVED         \`ServiceMutation.uploadSchema\` arg \`schema\` was removed
+                FAIL    ARG_REMOVED         \`ServiceMutation.uploadSchema\` arg \`tag\` was removed
+                FAIL    FIELD_CHANGED_TYPE  \`Change.argNode\` changed type from \`NamedIntrospectionArg\` to \`NamedIntrospectionValue\`
+                FAIL    FIELD_REMOVED       \`Change.affectedClients\` was removed
+                FAIL    FIELD_REMOVED       \`NamedIntrospectionValue.printedType\` was removed
+                FAIL    TYPE_REMOVED        \`NamedIntrospectionArg\` removed
 
-        View full details at: https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z"
-      `);
+                View full details at: https://engine-dev.apollographql.com/service/engine/checks?schemaTag=Detached%3A%20d664f715645c5f0bb5ad4f2260cd6cb8d19bbc68&schemaTagId=f9f68e7e-1b5f-4eab-a3da-1fd8cd681111&from=2019-03-26T22%3A25%3A12.887Z"
+            `);
     });
   });
 });
@@ -214,7 +581,7 @@ describe("service:check", () => {
 // });
 
 // // this is because of herkou-cli-utils hacky mocking system on their console logger
-// import { stdout, mockConsole } from "heroku-cli-util";
+// import { stdout, captureApplicationOutput } from "heroku-cli-util";
 // import path from "path";
 // import fs from "fs";
 // import { test as setup } from "apollo-cli-test";
@@ -225,7 +592,7 @@ describe("service:check", () => {
 
 // import { vol, fs as mockFS } from "apollo-codegen-core/lib/localfs";
 
-// const test = setup.do(() => mockConsole());
+// const test = setup.do(() => captureApplicationOutput());
 // const ENGINE_API_KEY = "service:test:1234";
 // const hash = "12345";
 // const schemaContents = fs.readFileSync(

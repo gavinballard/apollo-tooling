@@ -1,0 +1,44 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`service:check integration non-federated should report traffic errors correctly 1`] = `
+"Loading Apollo Project [started]
+Loading Apollo Project [completed]
+Validating local schema against tag master on service engine [started]
+→ Resolving schema
+→ Validating schema
+Validated local schema against tag master on service engine [title changed]
+Validated local schema against tag master on service engine [completed]
+Comparing schema changes [started]
+Compared 1 schema change against 0 operations over the last 548 days [title changed]
+Compared 1 schema change against 0 operations over the last 548 days [completed]
+Reporting result [started]
+Found 1 breaking change and 0 compatible changes [title changed]
+Found 1 breaking change and 0 compatible changes [failed]
+→ breaking changes found
+
+FAIL    ARG_CHANGED_TYPE  \`Query.launches\` argument \`after\` has changed type from \`String\` to \`String!\`
+
+View full details at: https://engine-staging.apollographql.com/service/justin-fullstack-tutorial/check/3acd7765-61b2-4f1a-9227-8b288e42bfdc
+"
+`;
+
+exports[`service:check integration non-federated should report traffic notices correctly 1`] = `
+"Loading Apollo Project [started]
+Loading Apollo Project [completed]
+Validating local schema against tag master on service engine [started]
+→ Resolving schema
+→ Validating schema
+Validated local schema against tag master on service engine [title changed]
+Validated local schema against tag master on service engine [completed]
+Comparing schema changes [started]
+Compared 1 schema change against 0 operations over the last 548 days [title changed]
+Compared 1 schema change against 0 operations over the last 548 days [completed]
+Reporting result [started]
+Found 0 breaking changes and 1 compatible change [title changed]
+Found 0 breaking changes and 1 compatible change [completed]
+
+PASS    ARG_CHANGED_TYPE  \`Query.launches\` argument \`after\` has changed type from \`String\` to \`String!\`
+
+View full details at: https://engine-staging.apollographql.com/service/justin-fullstack-tutorial/check/3acd7765-61b2-4f1a-9227-8b288e42bfdc
+"
+`;
